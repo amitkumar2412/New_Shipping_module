@@ -1,0 +1,87 @@
+# Deploys to an EC2 host that has Docker + the compose plugin installed, the same
+# SSH-based approach chem-os uses. Required repository secrets:
+#   EC2_HOST, EC2_USER, EC2_SSH_KEY
+#   SHIPPING_DB_HOST, SHIPPING_DB_NAME, SHIPPING_DB_USER, SHIPPING_DB_PASSWORD, SHIPPING_API_KEY
+# Optional: SHIPPING_SCRAPER_PROXY
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-shipping-module
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      APP_DIR: /opt/shipping-module
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Write env file
+        env:
+          DB_HOST: ${{ secrets.SHIPPING_DB_HOST }}
+          DB_NAME: ${{ secrets.SHIPPING_DB_NAME }}
+          DB_USER: ${{ secrets.SHIPPING_DB_USER }}
+          DB_PASSWORD: ${{ secrets.SHIPPING_DB_PASSWORD }}
+          API_KEY: ${{ secrets.SHIPPING_API_KEY }}
+          SCRAPER_PROXY: ${{ secrets.SHIPPING_SCRAPER_PROXY }}
+        run: |
+          {
+            printf 'DB_HOST=%s\n' "$DB_HOST"
+            printf 'DB_PORT=5432\n'
+            printf 'DB_NAME=%s\n' "$DB_NAME"
+            printf 'DB_USER=%s\n' "$DB_USER"
+            printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
+            printf 'DB_SSLMODE=require\n'
+            printf 'API_KEY=%s\n' "$API_KEY"
+            printf 'SCRAPER_PROXY=%s\n' "$SCRAPER_PROXY"
+            printf 'LOG_FORMAT=json\n'
+          } > /tmp/shipping.env
+
+      - name: Upload code and env
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
+          $SSH "sudo mkdir -p $APP_DIR && sudo chown \$(id -u):\$(id -g) $APP_DIR"
+          git archive --format=tar HEAD | $SSH "tar -x -C $APP_DIR"
+          scp -i ~/.ssh/deploy_key /tmp/shipping.env "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$APP_DIR/.env"
+          $SSH "chmod 600 $APP_DIR/.env"
+
+      - name: Build and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "cd $APP_DIR && docker compose build && docker compose up -d --remove-orphans && docker image prune -f"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 24); do
+            if ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+                 "curl -fsS http://127.0.0.1:8000/ready" ; then
+              echo; echo "API ready (attempt $i)"
+              ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+                "cd $APP_DIR && docker compose ps && docker compose logs --tail 20 worker"
+              exit 0
+            fi
+            echo "Attempt $i: not ready, retrying in 5s..."
+            sleep 5
+          done
+          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "cd $APP_DIR && docker compose ps && docker compose logs --tail 50"
+          exit 1

@@ -1,5 +1,6 @@
-curl_cffi>=0.7
-psycopg2-binary>=2.9
-python-dotenv>=1.0
-fastapi>=0.111
-uvicorn[standard]>=0.29
+# Runtime dependencies, pinned. Tested on Python 3.11.
+curl_cffi==0.17.0
+psycopg2-binary==2.9.13
+python-dotenv==1.2.4
+fastapi==0.165.0
+uvicorn[standard]==0.54.0

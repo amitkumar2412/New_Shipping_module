@@ -1,9 +1,15 @@
-"""PostgreSQL table definitions and mainshipdata column manifest."""
+"""PostgreSQL table definitions and mainshipdata column manifest.
+
+Applied explicitly with `python main.py migrate` (never on app startup). Every
+statement is idempotent, so re-running it is safe.
+"""
+
+# Enables similarity()/% fuzzy matching used by the ship-inventory search API.
+# Creating an extension needs elevated privileges, so migrate only runs this when
+# the extension is missing; if the app user can't create it, a DBA runs it once.
+EXTENSION = "CREATE EXTENSION IF NOT EXISTS pg_trgm"
 
 TABLES = [
-    # Enables similarity()/% fuzzy matching used by the ship-inventory search API.
-    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
-
     """CREATE TABLE IF NOT EXISTS ships (
         ship_id     INTEGER PRIMARY KEY,
         label       TEXT,
@@ -230,6 +236,13 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_snapshots_ship ON snapshots (ship_id, scraped_at)",
     "CREATE INDEX IF NOT EXISTS idx_mainshipdata_vessel_name_trgm ON mainshipdata USING gin (vessel_name gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_mainshipdata_vessel_ais_name_trgm ON mainshipdata USING gin (vessel_ais_name gin_trgm_ops)",
+
+    # Set by POST /ships/{id}/scrape; the worker scrapes flagged ships on its next poll and clears it.
+    "ALTER TABLE ships ADD COLUMN IF NOT EXISTS scrape_requested_at TEXT",
+    # Mirrors chem-os's shipwithid.my_ship; my-ships are refreshed more often.
+    "ALTER TABLE ships ADD COLUMN IF NOT EXISTS my_ship SMALLINT NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_scrape_log_ship ON scrape_log (ship_id, scraped_at)",
+    "CREATE INDEX IF NOT EXISTS idx_voyages_ship_seen ON voyages (ship_id, last_seen_at)",
 ]
 
 # Columns of mainshipdata (excluding id and synced_at) in insertion order.

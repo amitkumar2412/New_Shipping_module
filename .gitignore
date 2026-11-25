@@ -8,6 +8,12 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+.pytest_cache/
 
 # Logs
 *.log
+
+# Local CLI output (show --csv, track --geojson, export)
+ships_latest.csv
+*.geojson
+export/
