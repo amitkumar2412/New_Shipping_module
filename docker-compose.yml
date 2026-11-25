@@ -21,6 +21,7 @@ services:
     <<: *app
     command: ["python", "main.py", "migrate"]
     restart: "no"
+    mem_limit: 256m
     healthcheck:
       disable: true
 
@@ -28,13 +29,18 @@ services:
     <<: *app
     command: ["python", "main.py", "worker"]
     stop_grace_period: 2m
+    # Shares the host with chem-os: cap memory so a fault here can't starve it.
+    mem_limit: 512m
+    cpus: 0.5
     depends_on:
       migrate:
         condition: service_completed_successfully
 
   api:
     <<: *app
-    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers"]
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]
+    mem_limit: 384m
+    cpus: 0.5
     ports:
       # Bound to localhost: expose through a reverse proxy or a private network, not directly.
       - "127.0.0.1:${API_PORT:-8000}:8000"

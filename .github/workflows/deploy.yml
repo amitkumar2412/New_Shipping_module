@@ -67,7 +67,7 @@ jobs:
       - name: Build and restart
         run: |
           ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-            "cd $APP_DIR && docker compose build && docker compose up -d --remove-orphans && docker image prune -f"
+            "cd $APP_DIR && docker compose build && docker compose up -d --remove-orphans && docker image prune -f && docker builder prune -f --filter until=72h && df -h /"
 
       - name: Health check
         run: |
