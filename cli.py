@@ -10,7 +10,7 @@ import os
 from database import Store, flatten
 from database.store import EXPORTABLE_TABLES
 from scraper import ScrapeError
-from worker import Worker, heartbeat_age, make_client
+from runner import Runner, make_client
 
 log = logging.getLogger("tracker")
 
@@ -21,37 +21,34 @@ def cmd_migrate(store: Store, _args, _settings):
     return 0
 
 
-def cmd_worker(store: Store, _args, settings, stop=None):
+def cmd_run(store: Store, args, settings, stop=None):
+    """The scheduled job. Exit 0 = run completed; 2 = stopped early or every ship failed."""
     _require_schema(store)
-    Worker(store, settings, stop=stop).run_forever()
+    result = Runner(store, settings, stop=stop).run(ship_ids=args.ship_ids or None)
+    if result is None:
+        log.warning("Another run is already in progress; skipping this one")
+        return 0
+    if result.stopped_early or (result.total and result.ok == 0):
+        return 2
     return 0
 
 
-def cmd_run(store: Store, args, settings, stop=None):
-    _require_schema(store)
-    if args.loop:
-        # Kept for backwards compatibility. Refresh intervals now come from settings.
-        log.warning("`run --loop` is deprecated and ignores MINUTES; use `worker` (intervals are set in .env)")
-        return cmd_worker(store, args, settings, stop=stop)
-    result = Worker(store, settings, stop=stop).run_once()
-    if result is None:
-        log.error("Another worker is already scraping; not starting a second run")
+def cmd_status(store: Store, args, settings):
+    """Read-only: database and schema check plus a summary of recent scrape runs."""
+    store.db.ping()
+    print("database:    reachable")
+    if not store.schema_ready():
+        print("schema:      MISSING or out of date - run: python main.py migrate")
         return 1
-    ok, total = result
-    return 0 if ok == total else 2
-
-
-def cmd_healthcheck(_store, _args, settings):
-    """Exit 0 if the worker wrote a heartbeat recently. Used by the container health check."""
-    age = heartbeat_age(settings.heartbeat_file)
-    limit = max(settings.poll_seconds * 3, 900)
-    if age is None:
-        print("unhealthy: no heartbeat")
-        return 1
-    if age > limit:
-        print(f"unhealthy: last heartbeat {age:.0f}s ago (limit {limit}s)")
-        return 1
-    print(f"healthy: last heartbeat {age:.0f}s ago")
+    print("schema:      up to date")
+    found = store.table_exists(settings.my_ships_table)
+    print(f"my-ships:    table {settings.my_ships_table} {'found' if found else 'NOT FOUND (my-ships will not be tracked)'}")
+    s = store.run_summary(args.hours)
+    print(f"tracked:     {s['tracked']} ships ({s['tracked_my_ships']} my-ships)")
+    print(f"last {args.hours}h:    {s['attempts']} attempts, {s['ok']} ok, {s['ships']} ships, "
+          f"last attempt {s['last_attempt'] or 'never'}")
+    for f in s["failures"]:
+        print(f"  failed {f['ship_id']} at {f['scraped_at']}: {(f['error'] or '')[:150]}")
     return 0
 
 

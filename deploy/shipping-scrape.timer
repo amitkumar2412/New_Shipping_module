@@ -1,0 +1,14 @@
+[Unit]
+Description=Shipping module: scrape twice a day (~09:00 and ~17:00 IST)
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Kolkata
+OnCalendar=*-*-* 17:00:00 Asia/Kolkata
+# Start at a random moment in the 30 minutes after each time, different every day.
+RandomizedDelaySec=30min
+AccuracySec=1min
+# If the server was off at run time, run once as soon as it's back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

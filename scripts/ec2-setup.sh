@@ -1,46 +1,31 @@
 #!/bin/bash
 # One-time EC2 setup for the shipping module (Amazon Linux 2023).
-# Installs Docker + the compose and buildx plugins and creates the app directory.
+# Installs Python 3.11 and creates the service user and directories.
+# Changes nothing that chem-os, the email platform or the Next.js apps use.
 # Run as: sudo bash ec2-setup.sh
-# The GitHub deploy workflow does the rest (code upload, .env, docker compose up).
+# The GitHub deploy workflow does the rest (code, venv, settings, systemd timer).
 set -euo pipefail
 
 APP_DIR="/opt/shipping-module"
-APP_USER="ec2-user"
-PLUGIN_DIR="/usr/local/lib/docker/cli-plugins"
-ARCH="$(uname -m)"                      # x86_64 or aarch64
-case "$ARCH" in
-  x86_64)  GOARCH=amd64 ;;
-  aarch64) GOARCH=arm64 ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
+ETC_DIR="/etc/shipping-module"
+APP_USER="shipping"
 
-echo "==> Installing Docker..."
-dnf install -y docker
-systemctl enable --now docker
-usermod -aG docker "$APP_USER"
+echo "==> Installing Python 3.11 (alongside the system Python 3.9; nothing else changes)..."
+dnf install -y python3.11
 
-echo "==> Installing docker compose plugin..."
-mkdir -p "$PLUGIN_DIR"
-curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$ARCH" \
-  -o "$PLUGIN_DIR/docker-compose"
-chmod +x "$PLUGIN_DIR/docker-compose"
+echo "==> Creating service user '$APP_USER' (no login shell, no home)..."
+id "$APP_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin "$APP_USER"
 
-echo "==> Installing docker buildx plugin..."
-BUILDX_VERSION="$(curl -fsSL https://api.github.com/repos/docker/buildx/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${GOARCH}" \
-  -o "$PLUGIN_DIR/docker-buildx"
-chmod +x "$PLUGIN_DIR/docker-buildx"
+echo "==> Creating directories..."
+mkdir -p "$APP_DIR/releases"
+chown -R root:"$APP_USER" "$APP_DIR"
+chmod 755 "$APP_DIR" "$APP_DIR/releases"
+mkdir -p "$ETC_DIR"
+chown root:"$APP_USER" "$ETC_DIR"
+chmod 750 "$ETC_DIR"
 
-echo "==> Creating app directory..."
-mkdir -p "$APP_DIR"
-chown "$APP_USER:$APP_USER" "$APP_DIR"
-
-docker --version
-docker compose version
-docker buildx version
-
+python3.11 --version
 echo
-echo "Done. Log out and back in (or run 'newgrp docker') so $APP_USER can use docker without sudo."
-echo "Before the first deploy, check that this server can reach the database:"
-echo "  curl -v telnet://<DB_HOST>:5432   (should connect; Ctrl+C to exit)"
+echo "Done. Nothing is running yet: the first deploy installs the code and the timer."
+echo "Optional check that this server can reach the database:"
+echo "  timeout 5 bash -c '</dev/tcp/<DB_HOST>/5432' && echo reachable"

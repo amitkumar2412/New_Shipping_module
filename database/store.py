@@ -9,7 +9,7 @@ log = logging.getLogger("tracker.db")
 
 # Arbitrary constants identifying this service's advisory locks.
 MIGRATE_LOCK_KEY = 0x5348_4950_0001
-WORKER_LOCK_KEY = 0x5348_4950_0002
+RUN_LOCK_KEY = 0x5348_4950_0002
 
 EXPORTABLE_TABLES = ("ships", "vessels", "shippingport", "positions", "voyages", "scrape_log", "mainshipdata")
 
@@ -43,17 +43,22 @@ class Store:
             )
             return bool(cur.fetchone()[0])
 
-    # ---- worker lock -------------------------------------------------------
+    def table_exists(self, table):
+        with self.db.transaction() as cur:
+            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table,))
+            return bool(cur.fetchone()[0])
 
-    def try_worker_lock(self):
-        """Returns a connection holding the worker lock, or None if another worker has it.
+    # ---- run lock ----------------------------------------------------------
+
+    def try_run_lock(self):
+        """Returns a connection holding the run lock, or None if another run has it.
 
         The lock lives as long as the connection: close it to release, and if the
         process dies Postgres releases it automatically.
         """
         conn = self.db.connect_dedicated()
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (WORKER_LOCK_KEY,))
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (RUN_LOCK_KEY,))
             if cur.fetchone()[0]:
                 return conn
         conn.close()
@@ -69,17 +74,6 @@ class Store:
                 (ship_id, label, now_utc()),
             )
 
-    def request_scrape(self, ship_id):
-        """Adds the ship to the watch list (re-activating it) and flags it for the worker's next poll."""
-        t = now_utc()
-        with self.db.transaction() as cur:
-            cur.execute(
-                "INSERT INTO ships (ship_id, active, added_at, scrape_requested_at) VALUES (%s, 1, %s, %s) "
-                "ON CONFLICT (ship_id) DO UPDATE SET active = 1, "
-                "scrape_requested_at = COALESCE(ships.scrape_requested_at, EXCLUDED.scrape_requested_at)",
-                (ship_id, t, t),
-            )
-
     def remove_ship(self, ship_id):
         with self.db.transaction() as cur:
             cur.execute("UPDATE ships SET active = 0 WHERE ship_id = %s", (ship_id,))
@@ -92,7 +86,7 @@ class Store:
     def list_all_ships(self):
         with self.db.transaction(dict_rows=True) as cur:
             cur.execute(
-                "SELECT s.ship_id, s.active, s.my_ship, s.scrape_requested_at, v.name, v.imo, v.updated_at "
+                "SELECT s.ship_id, s.active, s.my_ship, v.name, v.imo, v.updated_at "
                 "FROM ships s LEFT JOIN vessels v USING (ship_id) ORDER BY s.ship_id"
             )
             return [dict(r) for r in cur.fetchall()]
@@ -101,9 +95,9 @@ class Store:
         """Brings the watch list in line with chem-os and mainshipdata.
 
         - Ships chem-os flags `my_ship` that the watch list has never seen are added
-          as my-ships; never-scraped ships are due at once.
+          as my-ships.
         - Known ships that just became my-ships (e.g. picked for a new purchase) are
-          flagged and queued for an immediate refresh.
+          flagged, so they're scraped first.
         - Ships no longer flagged in chem-os drop back to the normal tier.
         - Ships in mainshipdata missing from the watch list are added as normal ships.
 
@@ -134,10 +128,9 @@ class Store:
                 )
                 result["added"] = sorted(r[0] for r in cur.fetchall())
                 cur.execute(
-                    """UPDATE ships SET my_ship = 1, scrape_requested_at = COALESCE(scrape_requested_at, %s)
+                    """UPDATE ships SET my_ship = 1
                        WHERE my_ship = 0 AND ship_id IN (SELECT ship_id FROM _my_ships)
-                       RETURNING ship_id""",
-                    (t,),
+                       RETURNING ship_id"""
                 )
                 result["promoted"] = sorted(r[0] for r in cur.fetchall())
                 cur.execute(
@@ -156,56 +149,51 @@ class Store:
             result["backfilled"] = sorted(r[0] for r in cur.fetchall())
         return result
 
-    def due_ships(self, my_ship_minutes, other_minutes, stationary_minutes, limit=None):
-        """Active ships that need scraping, most urgent first.
+    def ships_to_scrape(self, skip_recent_hours=0):
+        """Active ships for this run: my-ships first, then the ones waiting longest.
 
-        Each ship has its own refresh interval:
-          - my-ships: `my_ship_minutes`; other ships: `other_minutes`
-          - a ship last seen moored / at anchor / not moving waits at least
-            `stationary_minutes` (it never shortens a longer interval)
-        measured from the last time we have data for it: its last scrape attempt
-        (success or failure, so a broken id isn't retried every poll) or, for
-        ships carried over from earlier versions, when their data was stored.
-
-        A ship is due when it was explicitly requested, has never been seen, or
-        its interval has elapsed. Order: requested, never seen, most overdue.
+        Ships successfully scraped in the last `skip_recent_hours` are left out, so
+        a run that follows soon after another (a manual run, or a missed run
+        caught up after a reboot) doesn't scrape them twice.
         """
-        query = """
-            WITH w AS (
-                SELECT
-                    s.ship_id,
-                    s.scrape_requested_at,
-                    GREATEST(l.last_attempt::timestamptz, v.updated_at::timestamptz,
-                             m.synced_at::timestamptz) AS last_seen,
-                    CASE WHEN s.my_ship = 1 THEN %(my)s ELSE %(other)s END AS base_minutes,
-                    COALESCE(
-                        m.position_navigational_status ILIKE '%%moored%%'
-                        OR m.position_navigational_status ILIKE '%%anchor%%'
-                        OR m.position_speed < 0.5,
-                        FALSE) AS stationary
-                FROM ships s
-                LEFT JOIN LATERAL (
-                    SELECT MAX(scraped_at) AS last_attempt FROM scrape_log l WHERE l.ship_id = s.ship_id
-                ) l ON TRUE
-                LEFT JOIN vessels v ON v.ship_id = s.ship_id
-                LEFT JOIN mainshipdata m ON m.vessel_ship_id = s.ship_id
-                WHERE s.active = 1
-            ), d AS (
-                SELECT *, last_seen + make_interval(mins =>
-                    CASE WHEN stationary THEN GREATEST(base_minutes, %(stationary)s) ELSE base_minutes END
-                ) AS due_at
-                FROM w
-            )
-            SELECT ship_id FROM d
-            WHERE scrape_requested_at IS NOT NULL OR last_seen IS NULL OR due_at <= now()
-            ORDER BY (scrape_requested_at IS NULL), (last_seen IS NOT NULL), due_at, ship_id"""
-        params = {"my": my_ship_minutes, "other": other_minutes, "stationary": stationary_minutes}
-        if limit is not None:
-            query += " LIMIT %(limit)s"
-            params["limit"] = limit
         with self.db.transaction() as cur:
-            cur.execute(query, params)
+            cur.execute(
+                """SELECT s.ship_id
+                   FROM ships s
+                   LEFT JOIN LATERAL (
+                       SELECT MAX(scraped_at) AS last_ok FROM scrape_log l WHERE l.ship_id = s.ship_id AND l.ok = 1
+                   ) l ON TRUE
+                   WHERE s.active = 1
+                     AND (l.last_ok IS NULL
+                          OR l.last_ok::timestamptz < now() - make_interval(hours => %s))
+                   ORDER BY s.my_ship DESC, l.last_ok NULLS FIRST, s.ship_id""",
+                (skip_recent_hours,),
+            )
             return [r[0] for r in cur.fetchall()]
+
+    def run_summary(self, hours=24):
+        """Scrape attempts in the last `hours`: totals, and the latest error per failing ship."""
+        with self.db.transaction(dict_rows=True) as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS attempts, COALESCE(SUM(ok), 0) AS ok,
+                          COUNT(DISTINCT ship_id) AS ships, MAX(scraped_at) AS last_attempt
+                   FROM scrape_log
+                   WHERE scraped_at::timestamptz > now() - make_interval(hours => %s)""",
+                (hours,),
+            )
+            totals = dict(cur.fetchone())
+            cur.execute(
+                """SELECT DISTINCT ON (ship_id) ship_id, scraped_at, error
+                   FROM scrape_log
+                   WHERE scraped_at::timestamptz > now() - make_interval(hours => %s) AND ok = 0
+                   ORDER BY ship_id, scraped_at DESC""",
+                (hours,),
+            )
+            totals["failures"] = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(my_ship), 0) AS mine FROM ships WHERE active = 1")
+            row = cur.fetchone()
+            totals["tracked"], totals["tracked_my_ships"] = row["n"], row["mine"]
+        return totals
 
     # ---- saving a scrape ---------------------------------------------------
 
@@ -217,7 +205,6 @@ class Store:
         with self.db.transaction(dict_rows=True) as cur:
             new_position = self._save(cur, ship_id, data)
             self._upsert_mainshipdata(cur, flatten(self._latest(cur, ship_id)))
-            cur.execute("UPDATE ships SET scrape_requested_at = NULL WHERE ship_id = %s", (ship_id,))
         return new_position
 
     def _save(self, cur, ship_id, data):
@@ -365,7 +352,6 @@ class Store:
                 "INSERT INTO scrape_log (ship_id, scraped_at, ok, error) VALUES (%s, %s, 0, %s)",
                 (ship_id, now_utc(), str(error)[:2000]),
             )
-            cur.execute("UPDATE ships SET scrape_requested_at = NULL WHERE ship_id = %s", (ship_id,))
 
     # ---- reading -----------------------------------------------------------
 
@@ -398,7 +384,7 @@ class Store:
         """Watch-list entry and most recent scrape attempt for one ship, or None if unknown."""
         with self.db.transaction(dict_rows=True) as cur:
             cur.execute(
-                "SELECT ship_id, label, active, my_ship, added_at, scrape_requested_at FROM ships WHERE ship_id = %s",
+                "SELECT ship_id, label, active, my_ship, added_at FROM ships WHERE ship_id = %s",
                 (ship_id,),
             )
             ship = cur.fetchone()

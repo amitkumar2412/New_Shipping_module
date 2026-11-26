@@ -3,6 +3,16 @@ import pytest
 from conftest import vessel_payload
 
 
+def age(store, ship_id, minutes):
+    """Pretends the ship's scrape attempts happened `minutes` ago."""
+    with store.db.transaction() as cur:
+        cur.execute(
+            "UPDATE scrape_log SET scraped_at = to_char(now() at time zone 'utc' - make_interval(mins => %s), "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') WHERE ship_id = %s",
+            (minutes, ship_id),
+        )
+
+
 def test_migrate_is_idempotent(store):
     store.migrate()
     store.migrate()
@@ -26,6 +36,13 @@ def test_save_writes_tables_and_mainshipdata_atomically(store):
     assert rows[0]["position_area_name"] == "Arabian Sea"
 
 
+def test_position_history_builds_a_route(store):
+    store.add_ship(1)
+    for ts in (1_700_000_000, 1_700_028_800, 1_700_057_600):  # three scrapes, 8h apart
+        store.save(1, vessel_payload(1, position_ts=ts))
+    assert [p["position_ts"] for p in store.track(1)] == [1_700_000_000, 1_700_028_800, 1_700_057_600]
+
+
 def test_failed_save_rolls_back_everything(store):
     store.add_ship(1)
     bad = vessel_payload(1)
@@ -38,51 +55,21 @@ def test_failed_save_rolls_back_everything(store):
     assert store.db.ping()
 
 
-MY, OTHER, STATIONARY = 360, 1440, 600
-
-
-def due(store, **kw):
-    return store.due_ships(MY, OTHER, STATIONARY, **kw)
-
-
-def age(store, ship_id, minutes):
-    """Pretends every record we have for the ship is `minutes` old."""
-    with store.db.transaction() as cur:
-        ts = f"to_char(now() at time zone 'utc' - interval '{int(minutes)} minutes', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
-        cur.execute(f"UPDATE scrape_log SET scraped_at = {ts} WHERE ship_id = %s", (ship_id,))
-        cur.execute(f"UPDATE vessels SET updated_at = {ts} WHERE ship_id = %s", (ship_id,))
-        cur.execute(f"UPDATE mainshipdata SET synced_at = {ts} WHERE vessel_ship_id = %s", (ship_id,))
-
-
-def set_status(store, ship_id, status, speed):
-    with store.db.transaction() as cur:
-        cur.execute(
-            "UPDATE mainshipdata SET position_navigational_status = %s, position_speed = %s WHERE vessel_ship_id = %s",
-            (status, speed, ship_id),
-        )
-
-
 def test_sync_adds_my_ships(store, shipwithid):
     shipwithid(100, "MINE", my_ship=True)
     shipwithid(200, "NOT MINE", my_ship=False)
-    r = store.sync_ships("shipwithid")
-    assert r["added"] == [100]
+    assert store.sync_ships("shipwithid")["added"] == [100]
     assert store.sync_ships("shipwithid")["added"] == []  # already on the watch list
     assert store.active_ships() == [100]
     assert store.scrape_status(100)["my_ship"] == 1
 
 
-def test_sync_promotes_known_ship_and_queues_refresh(store, shipwithid):
+def test_sync_promotes_known_ship(store, shipwithid):
     """A ship already tracked as an 'other' ship gets picked for a purchase."""
     store.add_ship(300)
-    store.save(300, vessel_payload(300))
-    assert due(store) == []
     shipwithid(300, "NOW MINE")
-    r = store.sync_ships("shipwithid")
-    assert r["promoted"] == [300]
-    status = store.scrape_status(300)
-    assert status["my_ship"] == 1 and status["scrape_requested_at"] is not None
-    assert due(store) == [300]
+    assert store.sync_ships("shipwithid")["promoted"] == [300]
+    assert store.scrape_status(300)["my_ship"] == 1
 
 
 def test_sync_demotes_unflagged_ship(store, shipwithid):
@@ -91,7 +78,7 @@ def test_sync_demotes_unflagged_ship(store, shipwithid):
     shipwithid(100, "MINE", my_ship=False)
     assert store.sync_ships("shipwithid")["demoted"] == 1
     assert store.scrape_status(100)["my_ship"] == 0
-    assert store.active_ships() == [100]  # still tracked, just less often
+    assert store.active_ships() == [100]  # still tracked
 
 
 def test_sync_backfills_ships_from_mainshipdata(store):
@@ -100,8 +87,6 @@ def test_sync_backfills_ships_from_mainshipdata(store):
     assert r["added"] is None  # no chem-os table in this database
     assert r["backfilled"] == [555]
     assert store.scrape_status(555)["my_ship"] == 0
-    # It has data from before, so it isn't scraped immediately.
-    assert due(store) == []
 
 
 def test_sync_respects_manual_removal(store, shipwithid):
@@ -117,81 +102,38 @@ def test_sync_ignores_ids_out_of_range(store, shipwithid):
     assert store.sync_ships("shipwithid")["added"] == []
 
 
-def test_due_ships_priority(store):
-    for sid in (1, 2, 3, 4):
-        store.add_ship(sid)
-    store.save(1, vessel_payload(1))          # fresh: not due
-    store.save(2, vessel_payload(2))
-    store.request_scrape(2)                   # fresh but explicitly requested
-    store.log_error(3, "boom")                # failed recently: not due
-    # 4 was never attempted
-    assert due(store) == [2, 4]
-    assert due(store, limit=1) == [2]
-
-
-def test_my_ships_refresh_every_6h_others_every_24h(store, shipwithid):
-    shipwithid(1, "MINE")
-    store.sync_ships("shipwithid")
-    store.add_ship(2)
-    for sid in (1, 2):
-        store.save(sid, vessel_payload(sid))
-        age(store, sid, 7 * 60)
-    assert due(store) == [1]
-    age(store, 2, 27 * 60)  # 3h overdue vs. 1h for ship 1
-    assert due(store) == [2, 1]  # most overdue first
-
-
-def test_stationary_my_ship_waits_10h(store, shipwithid):
-    shipwithid(1, "MINE")
-    store.sync_ships("shipwithid")
-    store.save(1, vessel_payload(1))
-    set_status(store, 1, "Moored", 0.0)
-    age(store, 1, 7 * 60)
-    assert due(store) == []
-    age(store, 1, 11 * 60)
-    assert due(store) == [1]
-
-
-def test_stationary_detection(store, shipwithid):
-    shipwithid(1, "A")
-    shipwithid(2, "B")
-    shipwithid(3, "C")
+def test_ships_to_scrape_order_and_skip(store, shipwithid):
+    shipwithid(4, "MINE")
     store.sync_ships("shipwithid")
     for sid in (1, 2, 3):
-        store.save(sid, vessel_payload(sid))
-        age(store, sid, 7 * 60)
-    set_status(store, 1, "At Anchor", 0.1)
-    set_status(store, 2, "Underway using Engine", 0.2)  # drifting: treated as stationary
-    set_status(store, 3, "Underway using Engine", 12.8)
-    assert due(store) == [3]
-
-
-def test_stationary_never_shortens_the_24h_interval(store):
-    store.add_ship(1)
+        store.add_ship(sid)
     store.save(1, vessel_payload(1))
-    set_status(store, 1, "Moored", 0.0)
-    age(store, 1, 11 * 60)
-    assert due(store) == []
+    age(store, 1, 10 * 60)            # scraped 10h ago
+    store.save(2, vessel_payload(2))  # scraped just now: skipped
+    store.log_error(3, "boom")        # failed just now: retried (only successes are skipped)
+    store.add_ship(5)
+    store.remove_ship(5)              # inactive: never scraped
+    # my-ship first, then never scraped successfully, then oldest success
+    assert store.ships_to_scrape(skip_recent_hours=2) == [4, 3, 1]
+    assert store.ships_to_scrape(skip_recent_hours=0) == [4, 3, 1, 2]
 
 
-def test_request_scrape_reactivates_and_clears_after_attempt(store):
-    store.add_ship(9)
-    store.remove_ship(9)
-    store.request_scrape(9)
-    status = store.scrape_status(9)
-    assert status["active"] == 1 and status["scrape_requested_at"] is not None
-    store.log_error(9, "boom")
-    status = store.scrape_status(9)
-    assert status["scrape_requested_at"] is None
-    assert status["last_attempt"]["ok"] == 0
+def test_run_summary(store):
+    store.add_ship(1)
+    store.add_ship(2)
+    store.save(1, vessel_payload(1))
+    store.log_error(2, "HTTP 500")
+    s = store.run_summary(24)
+    assert (s["attempts"], s["ok"], s["ships"], s["tracked"]) == (2, 1, 2, 2)
+    assert [f["ship_id"] for f in s["failures"]] == [2]
 
 
-def test_worker_lock_is_exclusive(store):
-    first = store.try_worker_lock()
+def test_run_lock_is_exclusive(store):
+    first = store.try_run_lock()
     assert first is not None
-    assert store.try_worker_lock() is None
+    assert store.try_run_lock() is None
     first.close()
-    second = store.try_worker_lock()
+    second = store.try_run_lock()
     assert second is not None
     second.close()
 

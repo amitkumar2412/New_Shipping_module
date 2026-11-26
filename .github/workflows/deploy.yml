@@ -1,7 +1,7 @@
-# Deploys to an EC2 host that has Docker + the compose plugin installed, the same
-# SSH-based approach chem-os uses. Required repository secrets:
+# Deploys to the EC2 host over SSH, the same way chem-os does. One-time server
+# prep: `sudo bash scripts/ec2-setup.sh`. Required repository secrets:
 #   EC2_HOST, EC2_USER, EC2_SSH_KEY
-#   SHIPPING_DB_HOST, SHIPPING_DB_NAME, SHIPPING_DB_USER, SHIPPING_DB_PASSWORD, SHIPPING_API_KEY
+#   SHIPPING_DB_HOST, SHIPPING_DB_NAME, SHIPPING_DB_USER, SHIPPING_DB_PASSWORD
 # Optional: SHIPPING_SCRAPER_PROXY
 
 name: Deploy
@@ -23,7 +23,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     env:
-      APP_DIR: /opt/shipping-module
+      TARGET: ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}
 
     steps:
       - uses: actions/checkout@v4
@@ -35,15 +35,16 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Write env file
+      - name: Build release and settings
         env:
           DB_HOST: ${{ secrets.SHIPPING_DB_HOST }}
           DB_NAME: ${{ secrets.SHIPPING_DB_NAME }}
           DB_USER: ${{ secrets.SHIPPING_DB_USER }}
           DB_PASSWORD: ${{ secrets.SHIPPING_DB_PASSWORD }}
-          API_KEY: ${{ secrets.SHIPPING_API_KEY }}
           SCRAPER_PROXY: ${{ secrets.SHIPPING_SCRAPER_PROXY }}
         run: |
+          git archive --format=tar.gz -o /tmp/shipping-release.tar.gz HEAD
+          umask 077
           {
             printf 'DB_HOST=%s\n' "$DB_HOST"
             printf 'DB_PORT=5432\n'
@@ -51,37 +52,19 @@ jobs:
             printf 'DB_USER=%s\n' "$DB_USER"
             printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
             printf 'DB_SSLMODE=require\n'
-            printf 'API_KEY=%s\n' "$API_KEY"
             printf 'SCRAPER_PROXY=%s\n' "$SCRAPER_PROXY"
-            printf 'LOG_FORMAT=json\n'
           } > /tmp/shipping.env
 
-      - name: Upload code and env
+      - name: Upload
         run: |
-          SSH="ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
-          $SSH "sudo mkdir -p $APP_DIR && sudo chown \$(id -u):\$(id -g) $APP_DIR"
-          git archive --format=tar HEAD | $SSH "tar -x -C $APP_DIR"
-          scp -i ~/.ssh/deploy_key /tmp/shipping.env "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:$APP_DIR/.env"
-          $SSH "chmod 600 $APP_DIR/.env"
+          scp -i ~/.ssh/deploy_key /tmp/shipping-release.tar.gz /tmp/shipping.env scripts/deploy.sh "$TARGET:/tmp/"
+          ssh -i ~/.ssh/deploy_key "$TARGET" "chmod 600 /tmp/shipping.env"
 
-      - name: Build and restart
+      - name: Install release
         run: |
-          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-            "cd $APP_DIR && docker compose build && docker compose up -d --remove-orphans && docker image prune -f && docker builder prune -f --filter until=72h && df -h /"
+          ssh -i ~/.ssh/deploy_key "$TARGET" \
+            "sudo bash /tmp/deploy.sh /tmp/shipping-release.tar.gz /tmp/shipping.env; rc=\$?; rm -f /tmp/deploy.sh /tmp/shipping-release.tar.gz /tmp/shipping.env; exit \$rc"
 
-      - name: Health check
-        run: |
-          for i in $(seq 1 24); do
-            if ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-                 "curl -fsS http://127.0.0.1:8000/ready" ; then
-              echo; echo "API ready (attempt $i)"
-              ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-                "cd $APP_DIR && docker compose ps && docker compose logs --tail 20 worker"
-              exit 0
-            fi
-            echo "Attempt $i: not ready, retrying in 5s..."
-            sleep 5
-          done
-          ssh -i ~/.ssh/deploy_key "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
-            "cd $APP_DIR && docker compose ps && docker compose logs --tail 50"
-          exit 1
+      - name: Clean up local secrets
+        if: always()
+        run: rm -f /tmp/shipping.env ~/.ssh/deploy_key

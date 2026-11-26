@@ -6,18 +6,17 @@ from config import ConfigError, load_settings
 def test_defaults(monkeypatch):
     s = load_settings()
     assert s.db_port == 5432
-    assert (s.my_ship_interval_minutes, s.other_ship_interval_minutes, s.stationary_interval_minutes) == (360, 1440, 600)
-    assert s.max_ships_per_hour == 60
     assert s.sync_my_ships is True
     assert s.my_ships_table == "shipwithid"
-    assert s.api_key is None
+    assert s.skip_recent_hours == 2
+    assert s.max_run_minutes == 240
 
 
 @pytest.mark.parametrize("name,value,message", [
     ("DB_HOST", "db.example.com/shipping", "bare hostname"),
     ("DB_PORT", "abc", "integer"),
-    ("MY_SHIP_INTERVAL_MINUTES", "5", ">= 30"),
-    ("MAX_SHIPS_PER_HOUR", "0", ">= 1"),
+    ("MAX_RUN_MINUTES", "5", ">= 10"),
+    ("SKIP_RECENT_HOURS", "-1", ">= 0"),
     ("SYNC_MY_SHIPS", "maybe", "true or false"),
     ("LOG_FORMAT", "xml", "text or json"),
     ("LOG_LEVEL", "LOUD", "LOG_LEVEL"),

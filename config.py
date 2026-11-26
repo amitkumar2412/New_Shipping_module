@@ -4,7 +4,6 @@ Everything is read once into a frozen Settings object. Invalid values fail fast 
 startup with a clear message instead of surfacing later as a confusing runtime error.
 """
 import os
-import tempfile
 from dataclasses import dataclass
 
 
@@ -58,23 +57,16 @@ class Settings:
     db_pool_max: int
     db_connect_timeout: int
 
-    # worker
-    my_ship_interval_minutes: int
-    other_ship_interval_minutes: int
-    stationary_interval_minutes: int
-    max_ships_per_hour: int
-    poll_seconds: int
+    # scheduled run
     sync_my_ships: bool
     my_ships_table: str
+    skip_recent_hours: int
+    max_run_minutes: int
     max_consecutive_blocks: int
-    heartbeat_file: str
 
     # scraper
     scraper_proxy: str | None
     scraper_timeout: int
-
-    # api
-    api_key: str | None
 
     # logging
     log_level: str
@@ -113,18 +105,13 @@ def load_settings() -> Settings:
         db_pool_min=pool_min,
         db_pool_max=pool_max,
         db_connect_timeout=_int("DB_CONNECT_TIMEOUT", 10, minimum=1),
-        my_ship_interval_minutes=_int("MY_SHIP_INTERVAL_MINUTES", 360, minimum=30),
-        other_ship_interval_minutes=_int("OTHER_SHIP_INTERVAL_MINUTES", 1440, minimum=60),
-        stationary_interval_minutes=_int("STATIONARY_INTERVAL_MINUTES", 600, minimum=30),
-        max_ships_per_hour=_int("MAX_SHIPS_PER_HOUR", 60, minimum=1),
-        poll_seconds=_int("POLL_SECONDS", 60, minimum=10),
         sync_my_ships=_bool("SYNC_MY_SHIPS", True),
         my_ships_table=my_ships_table,
+        skip_recent_hours=_int("SKIP_RECENT_HOURS", 2, minimum=0),
+        max_run_minutes=_int("MAX_RUN_MINUTES", 240, minimum=10),
         max_consecutive_blocks=_int("MAX_CONSECUTIVE_BLOCKS", 3, minimum=1),
-        heartbeat_file=_str("HEARTBEAT_FILE", os.path.join(tempfile.gettempdir(), "shipping-worker.heartbeat")),
         scraper_proxy=_str("SCRAPER_PROXY"),
         scraper_timeout=_int("SCRAPER_TIMEOUT", 30, minimum=5),
-        api_key=_str("API_KEY"),
         log_level=log_level,
         log_format=log_format,
     )

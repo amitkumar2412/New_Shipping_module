@@ -41,5 +41,8 @@ jobs:
           TEST_DB_PORT: '55432'
         run: python -m pytest -q -rs
 
-      - name: Build image
-        run: docker build -t shipping-module:ci .
+      - name: Check deploy scripts
+        run: |
+          bash -n scripts/deploy.sh scripts/ec2-setup.sh deploy/shipping
+          systemd-analyze verify --man=no deploy/shipping-scrape.timer || true
+          systemd-analyze calendar "*-*-* 09:00:00 Asia/Kolkata" "*-*-* 17:00:00 Asia/Kolkata"

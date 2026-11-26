@@ -1,75 +1,78 @@
 # Shipping Module (MarineTraffic Vessel Tracker)
 
-Scrapes vessel particulars, AIS positions and voyages from MarineTraffic's JSON endpoints into PostgreSQL. It runs as its own service next to chem-os and shares chem-os's database:
+Scrapes vessel particulars, AIS positions and voyages from MarineTraffic's JSON endpoints into PostgreSQL. It runs next to chem-os on the same server and shares chem-os's RDS database:
 
 - **It writes** `mainshipdata` plus its own history tables. chem-os's `/api/v1/ships/*` endpoints read `mainshipdata`.
 - **It reads** chem-os's `shipwithid` table. Every ship flagged `my_ship` is added to the watch list and scraped automatically.
 
+It runs on a schedule, twice a day, and exits after each run.
+
 ## How it runs
 
-The service has two processes plus a migration step. They share one Docker image.
+There is no always-running process. A systemd timer starts one scrape run twice a day; the run scrapes every ship once and exits. Between runs, nothing is running.
 
-| Process | Command | What it does |
-|---|---|---|
-| migrate | `python main.py migrate` | Creates or upgrades the schema. It is idempotent and runs on every deploy before the other two. |
-| worker | `python main.py worker` | Loops forever: syncs my-ships, then scrapes whatever is due (see below). |
-| api | `uvicorn api:app` | Read endpoints, health probes, and an on-demand scrape trigger. |
+| When | What happens |
+|---|---|
+| A random moment between 09:00 and 09:30 IST | Morning run: shows where ships got to overnight. |
+| A random moment between 17:00 and 17:30 IST | Evening run. |
+| The server was off at run time | The run happens as soon as the server is back up. |
 
-**Which ships are tracked.** Every poll (every `POLL_SECONDS`, default 60s), the worker syncs its watch list:
+**Each run:**
 
-- **My-ships:** every ship chem-os flags `my_ship` in `shipwithid`. A new one is scraped straight away. A ship already being tracked that gets picked for a new purchase is refreshed straight away and moves to the my-ship schedule.
-- **Other ships:** every ship in `mainshipdata`.
+1. **Syncs the watch list.** It adds every ship chem-os flags `my_ship` in `shipwithid`, and every ship in `mainshipdata`. A ship added to a purchase during the day is picked up by the next run.
+2. **Scrapes each ship once,** my-ships first, with a 3–8 second pause between ships. With about 150 ships, a run takes roughly 25–35 minutes. Ships scraped successfully in the last `SKIP_RECENT_HOURS` (2) are skipped, so a manual run followed by a timer run doesn't scrape twice.
+3. **Stops early** if MarineTraffic blocks `MAX_CONSECUTIVE_BLOCKS` (3) ships in a row, after `MAX_RUN_MINUTES` (240), or on shutdown. A shutdown first finishes the ship in progress.
 
-**How often.** Each ship has its own timer, counted from its last scrape. That spreads scrapes across the day; there's no hourly burst.
+**Results:** every attempt is written to `scrape_log`. Each scrape's position is added to `positions`, so the history builds up a route of two points per day. A run that stops early, or in which every ship failed, exits with code 2. systemd then marks it as failed, and it shows up in `systemctl --failed`.
 
-| Ship | Refreshed every | Setting |
-|---|---|---|
-| My-ship, moving | 6 hours | `MY_SHIP_INTERVAL_MINUTES` |
-| My-ship, moored / at anchor / speed under 0.5 kn | 10 hours | `STATIONARY_INTERVAL_MINUTES` |
-| Other ship | 24 hours | `OTHER_SHIP_INTERVAL_MINUTES` |
-
-Whether a ship is stationary comes from its last scrape. Failed attempts count toward the timer, so a bad ship id is not retried on every poll. Ships queued through `POST /ships/{id}/scrape` go first.
-
-**Load on MarineTraffic.** Each ship scrape is about 5 requests: 4 vessel calls plus port lookups, which are cached for 24 hours. The worker never scrapes more than `MAX_SHIPS_PER_HOUR` ships (default 60) and waits 3–8s between ships. If the cap is hit regularly, the worker logs a warning, because ships are falling behind schedule.
+**Load on MarineTraffic:** about 5 requests per ship (4 vessel calls plus port lookups, cached for 24 hours). For about 150 ships that's roughly 1,500 requests a day, one ship at a time.
 
 **Safety:**
-- **One scraper at a time.** Only one worker scrapes; a Postgres advisory lock enforces this. Extra workers wait as standbys and take over if the active one dies.
-- **Backing off when blocked.** If MarineTraffic blocks `MAX_CONSECUTIVE_BLOCKS` ships in a row (403, 429 or 503 on every retry), the worker pauses for 15 minutes. The pause doubles each time it happens again, up to 6 hours.
-- **Clean shutdown.** On SIGTERM the worker finishes the ship in progress and exits.
-- **Health check.** The worker writes a heartbeat file, which `python main.py healthcheck` checks.
-- **Atomic writes.** Each ship's scrape, history rows and `mainshipdata` row are written in a single transaction.
-
-## API
-
-When `API_KEY` is set, send it as the `X-API-Key` header on every endpoint except `/health` and `/ready`.
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /health` | Liveness check (no auth). |
-| `GET /ready` | Readiness check: is the database reachable? (no auth) |
-| `POST /ships/{ship_id}/scrape` | Queue a ship for scraping on the next poll. Returns `202`. Always needs `API_KEY`. |
-| `GET /ships/{ship_id}/status` | The ship's watch-list entry and its last scrape attempt. |
-| `GET /mainshipdata`, `/ship-inventory`, `/ship-inventory/search?q=` | Paginated reads (max 10 rows per page). |
+- **One run at a time:** a Postgres advisory lock stops a manual run and a timer run from overlapping.
+- **Atomic writes:** each ship's history rows and its `mainshipdata` row are written in a single transaction.
+- **Isolation on the shared server:** the service runs as its own `shipping` user with no login. It's limited to 400 MB of memory and half a CPU at low priority, the system files are read-only to it, and it can't see home directories.
 
 `ship_id` is MarineTraffic's **shipid**, the number in `marinetraffic.com/.../shipid:314687`. It is not the IMO or MMSI number.
 
 ## Deploying
 
-1. **Create the database user (one time).** A DBA runs [sql/grants.sql](sql/grants.sql) as an admin user. It creates a least-privilege `shipping_scraper` user and the `pg_trgm` extension. If the scraper tables already exist, also run section 5 of that file.
-2. **Prepare the server (one time).** On the EC2 host, run `sudo bash scripts/ec2-setup.sh`. It installs Docker and the compose plugin and creates `/opt/shipping-module`.
-3. **Configure.** Copy `.env.example` to `.env` and fill it in. Never commit `.env`.
-4. **Run.** `docker compose up -d --build` runs migrate, then starts the worker and the API. The API listens on `127.0.0.1:8000`; put a reverse proxy or a private network in front of it.
-5. **CI/CD.** `.github/workflows/ci.yml` runs the tests against Postgres and builds the image on every push and pull request. `.github/workflows/deploy.yml` deploys `main` to EC2 over SSH and checks `/ready`. The required secrets are listed at the top of that file.
+Everything runs on the existing EC2 host (Amazon Linux 2023). There's no Docker. On disk it takes about 160 MB: Python 3.11, plus the current release and one previous release kept for rollback.
 
-**Before the first production run**, check from the target server that MarineTraffic does not block its IP. Cloud IPs are blocked more often than home or office IPs. To check:
+**One-time setup:**
+
+1. **Database:** a DBA runs [sql/grants.sql](sql/grants.sql) as an admin user on RDS. It creates the least-privilege `shipping_scraper` user. If the scraper tables already exist, also run section 5.
+2. **Server:** run `sudo bash scripts/ec2-setup.sh`. It installs `python3.11` alongside the system Python and creates the `shipping` user, `/opt/shipping-module` and `/etc/shipping-module`. It doesn't touch chem-os, the email platform or the Next.js apps.
+3. **GitHub secrets:** add the secrets listed at the top of `.github/workflows/deploy.yml`.
+
+**Each deploy** happens on a push to `main`, or manually from the Actions tab. CI runs the tests, then `scripts/deploy.sh` runs on the server:
+
+1. Unpacks the code into `/opt/shipping-module/releases/<timestamp>` and builds its virtualenv.
+2. Writes the settings to `/etc/shipping-module/shipping.env` (readable only by root and `shipping`).
+3. Runs `migrate`, which also checks that the database is reachable.
+4. Switches `/opt/shipping-module/current` to the new release.
+5. Installs the systemd timer and the `shipping` command.
+6. Prints `status` and the time of the next run.
+
+A run already in progress finishes on the old release.
+
+**Rollback:** point the `current` link back at the previous release folder. For example:
 
 ```
-docker compose run --rm worker python main.py show 314687
+sudo ln -sfn /opt/shipping-module/releases/<previous> /opt/shipping-module/current
 ```
 
-If the server is blocked, set `SCRAPER_PROXY`.
+**On the server:**
 
-**Logs** go to stdout (in JSON when `LOG_FORMAT=json`). Docker rotates them. Read them with `docker compose logs -f worker`.
+```
+shipping status                                # read-only: DB check + last 24h of scrapes
+sudo systemctl start shipping-scrape.service   # run a full scrape now
+shipping run 314687                            # scrape one ship now
+systemctl list-timers shipping-scrape.timer    # when the next run is
+journalctl -u shipping-scrape -n 100           # logs of recent runs
+journalctl -u shipping-scrape -f               # follow a run live
+```
+
+**After the first deploy,** check that MarineTraffic doesn't block the server's IP with `shipping run 314687`. If you see `blocked`, set the `SHIPPING_SCRAPER_PROXY` secret and redeploy.
 
 ## Local development
 
@@ -83,12 +86,14 @@ docker run -d --rm --name shipping-test-pg -e POSTGRES_PASSWORD=test -e POSTGRES
 
 ```
 python main.py migrate                  # create / upgrade the schema
-python main.py worker                   # run the scraper continuously
+python main.py run                      # sync ships and scrape each once (what the timer runs)
+python main.py run 314687 123456        # scrape just these ships
+python main.py status                   # DB check + summary of the last 24h of scrapes
 python main.py add 314687 123456        # track ships by shipid
-python main.py run                      # scrape all tracked ships once (exit code 2 if any failed)
-python main.py show 314687              # latest stored record as JSON (fetches live if unknown)
 python main.py list                     # watch list
-python main.py remove 314687            # stop tracking (history kept; my-ship sync won't re-add it)
+python main.py remove 314687            # stop tracking (history kept; the sync won't re-add it)
+python main.py show 314687              # latest stored record as JSON (fetches live if unknown)
+python main.py track 314687 --geojson   # position history as a route
 python main.py export                   # dump all tables to ./export/*.csv
 ```
 
@@ -106,7 +111,7 @@ python main.py export                   # dump all tables to ./export/*.csv
 
 | Table | Contents |
 |---|---|
-| `ships` | The watch list. `my_ship` mirrors chem-os; `scrape_requested_at` is set by the scrape API. |
+| `ships` | The watch list. `my_ship` mirrors chem-os; my-ships are scraped first. |
 | `vessels` | One row per ship, overwritten with the latest particulars. |
 | `positions` | Position history, one row per distinct AIS report. |
 | `voyages` | One row per voyage or ETA change. Progress is updated in place. |

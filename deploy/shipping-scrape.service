@@ -1,0 +1,35 @@
+[Unit]
+Description=Shipping module: one scrape run (sync ships, scrape each once, exit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=shipping
+Group=shipping
+WorkingDirectory=/opt/shipping-module/current
+Environment=SHIPPING_ENV_FILE=/etc/shipping-module/shipping.env
+ExecStart=/opt/shipping-module/current/venv/bin/python main.py run
+# A run stops itself at MAX_RUN_MINUTES (240); this is the hard backstop.
+TimeoutStartSec=5h
+# On stop, the run finishes the ship in progress before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=3min
+SyslogIdentifier=shipping-scrape
+
+# Shares the host with chem-os: low priority and capped resources.
+Nice=10
+CPUWeight=20
+CPUQuota=50%
+MemoryHigh=300M
+MemoryMax=400M
+TasksMax=64
+
+# Hardening: read-only system, no home dirs, private /tmp.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

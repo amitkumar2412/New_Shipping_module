@@ -237,9 +237,7 @@ TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_mainshipdata_vessel_name_trgm ON mainshipdata USING gin (vessel_name gin_trgm_ops)",
     "CREATE INDEX IF NOT EXISTS idx_mainshipdata_vessel_ais_name_trgm ON mainshipdata USING gin (vessel_ais_name gin_trgm_ops)",
 
-    # Set by POST /ships/{id}/scrape; the worker scrapes flagged ships on its next poll and clears it.
-    "ALTER TABLE ships ADD COLUMN IF NOT EXISTS scrape_requested_at TEXT",
-    # Mirrors chem-os's shipwithid.my_ship; my-ships are refreshed more often.
+    # Mirrors chem-os's shipwithid.my_ship; my-ships are scraped first in each run.
     "ALTER TABLE ships ADD COLUMN IF NOT EXISTS my_ship SMALLINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_scrape_log_ship ON scrape_log (ship_id, scraped_at)",
     "CREATE INDEX IF NOT EXISTS idx_voyages_ship_seen ON voyages (ship_id, last_seen_at)",

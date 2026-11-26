@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Keep a developer's .env from leaking into tests.
 for _name in list(os.environ):
-    if _name.startswith(("DB_", "API_KEY", "SCRAPER_")):
+    if _name.startswith(("DB_", "SCRAPER_", "SHIPPING_")):
         del os.environ[_name]
 
 from config import load_settings  # noqa: E402
@@ -27,7 +27,7 @@ from database.store import EXPORTABLE_TABLES  # noqa: E402
 
 
 @pytest.fixture
-def settings(tmp_path):
+def settings():
     return replace(
         load_settings(),
         db_host=os.environ.get("TEST_DB_HOST", "localhost"),
@@ -37,8 +37,6 @@ def settings(tmp_path):
         db_password=os.environ.get("TEST_DB_PASSWORD", "test"),
         db_sslmode="disable",
         db_connect_timeout=3,
-        poll_seconds=10,
-        heartbeat_file=str(tmp_path / "heartbeat"),
     )
 
 

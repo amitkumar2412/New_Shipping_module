@@ -1,13 +1,12 @@
 """MarineTraffic vessel tracker.
 
   python main.py migrate                      create / upgrade the database schema (run on each deploy)
-  python main.py worker                       long-running scraper (the production process)
-  python main.py healthcheck                  exit 0 if the worker heartbeat is fresh
+  python main.py run                          the scheduled job: sync ships, scrape each once, exit
+  python main.py run 314687 123456            scrape just these ships now
+  python main.py status                       database check + summary of the last 24h of scrapes
   python main.py add 314687 [more ids...]     add ships to the watch list
   python main.py remove 314687                stop tracking a ship (history is kept)
   python main.py list                         show the watch list
-  python main.py run                          scrape every active ship once
-  python main.py run --loop 60                same as `worker` with a 60-minute interval
   python main.py show                         print latest data for ALL tracked ships
   python main.py show 314687 123456           print latest data for specific ship IDs
   python main.py show --csv                   export latest data for all ships to CSV + mainshipdata table
@@ -16,17 +15,19 @@
   python main.py track 314687 --geojson       export route as GeoJSON LineString (route.geojson)
   python main.py export [out_dir]             export every table to CSV
 
-Configuration is read from environment variables (or a .env file); see .env.example.
+Configuration is read from environment variables, or from the file named by
+SHIPPING_ENV_FILE (default: ./.env); see .env.example.
 """
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.environ.get("SHIPPING_ENV_FILE") or None)
 
 import psycopg2
 
@@ -35,7 +36,7 @@ from database import Database, Store
 from logging_config import setup_logging
 from cli import (
     cmd_add, cmd_remove, cmd_list, cmd_run, cmd_show, cmd_track, cmd_export,
-    cmd_migrate, cmd_worker, cmd_healthcheck,
+    cmd_migrate, cmd_status,
 )
 
 log = logging.getLogger("tracker")
@@ -46,8 +47,8 @@ def build_parser():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("migrate", help="create or upgrade the database schema")
-    sub.add_parser("worker", help="run the scraper continuously (production)")
-    sub.add_parser("healthcheck", help="exit 0 if the worker heartbeat is fresh")
+    st = sub.add_parser("status", help="database check + summary of recent scrapes (read-only)")
+    st.add_argument("--hours", type=int, default=24, help="summary window (default 24)")
 
     a = sub.add_parser("add", help="add ships to the watch list")
     a.add_argument("ship_ids", nargs="+", type=int)
@@ -57,8 +58,8 @@ def build_parser():
 
     sub.add_parser("list", help="show the watch list")
 
-    run = sub.add_parser("run", help="scrape all active ships")
-    run.add_argument("--loop", type=float, metavar="MINUTES", help="repeat every N minutes")
+    run = sub.add_parser("run", help="sync the watch list and scrape every ship once (the scheduled job)")
+    run.add_argument("ship_ids", nargs="*", type=int, help="only these ships (skips the sync)")
 
     s = sub.add_parser("show", help="print or export latest data")
     s.add_argument("ship_ids", nargs="*", type=int, help="ship IDs (omit for all tracked ships)")
@@ -83,8 +84,7 @@ def build_parser():
 
 COMMANDS = {
     "migrate":     cmd_migrate,
-    "worker":      cmd_worker,
-    "healthcheck": cmd_healthcheck,
+    "status":      cmd_status,
     "add":         cmd_add,
     "remove":      cmd_remove,
     "list":        cmd_list,
@@ -94,8 +94,8 @@ COMMANDS = {
     "export":      cmd_export,
 }
 
-# Commands that run until stopped and should shut down cleanly on SIGTERM / Ctrl+C.
-LONG_RUNNING = ("worker", "run")
+# Commands that should finish the current ship and stop cleanly on SIGTERM / Ctrl+C.
+LONG_RUNNING = ("run",)
 
 
 def main():
@@ -108,9 +108,6 @@ def main():
         return 78  # EX_CONFIG
 
     setup_logging(settings.log_level, settings.log_format)
-
-    if args.cmd == "healthcheck":
-        return cmd_healthcheck(None, args, settings)
 
     db = Database(settings)
     store = Store(db)

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Run the shipping module CLI on the server as the `shipping` user, with the
+# production settings. Installed to /usr/local/bin/shipping by deploy.sh.
+#   shipping status            # read-only health + last 24h summary
+#   shipping run 314687        # scrape one ship now
+#   shipping list              # watch list
+set -euo pipefail
+APP=/opt/shipping-module/current
+cd /tmp  # the shipping user can't read your home directory; CSV/GeoJSON output lands here
+exec sudo -u shipping SHIPPING_ENV_FILE=/etc/shipping-module/shipping.env \
+  "$APP/venv/bin/python" "$APP/main.py" "$@"
