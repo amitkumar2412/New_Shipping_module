@@ -7,6 +7,8 @@ Scrapes vessel particulars, AIS positions and voyages from MarineTraffic's JSON 
 
 It runs on a schedule, twice a day, and exits after each run.
 
+**Deploying, scheduling and operations:** see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## How it runs
 
 There is no always-running process. A systemd timer starts one scrape run twice a day; the run scrapes every ship once and exits. Between runs, nothing is running.
